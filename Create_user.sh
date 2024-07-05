@@ -1,72 +1,78 @@
 #!/bin/bash
 
-# File paths
-INPUT_FILE="$1"
-LOG_FILE="/var/log/user_management.log"
-PASSWORD_FILE="/var/secure/user_passwords.txt"
+# Set the log file and password file
+LOG_FILE=/var/log/user_management.log
+PASSWORD_FILE=/var/secure/user_passwords.txt
 
-# Function to log messages
-log_message() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
-}
-
-# Function to generate a random password
-generate_password() {
-    tr -dc 'A-Za-z0-9!@#$%^&*' < /dev/urandom | head -c 12
-}
-
-# Check if input file is provided
-if [ -z "$INPUT_FILE" ]; then
-    echo "Usage: $0 <input_file>"
-    exit 1
+# Check if the input file is provided
+if [ $# -ne 1 ]; then
+  echo "Usage: $0 <input_file>"
+  exit 1
 fi
 
-# Check if input file exists
-if [ ! -f "$INPUT_FILE" ]; then
-    echo "Input file not found: $INPUT_FILE"
-    exit 1
+# Read the input file
+INPUT_FILE=$1
+
+# Create the log file and password file if they don't exist
+touch $LOG_FILE
+chmod 600 $LOG_FILE
+touch $PASSWORD_FILE
+chmod 600 $PASSWORD_FILE
+
+# Ensure the pwgen tool is installed
+if ! command -v pwgen &> /dev/null; then
+  echo "pwgen could not be found, please install it." | tee -a $LOG_FILE
+  exit 1
 fi
 
-# Ensure log and password files are accessible
-touch "$LOG_FILE" "$PASSWORD_FILE" || { echo "Unable to access log or password file"; exit 1; }
-chmod 600 "$PASSWORD_FILE"
+# Iterate over each line in the input file
+while IFS=';' read -r user groups; do
+  # Remove whitespace from the user and groups
+  user=$(echo "$user" | tr -d '[:space:]')
+  groups=$(echo "$groups" | tr -d '[:space:]')
 
-# Read input file
-while IFS=';' read -r username groups
-do
-    username=$(echo "$username" | tr -d '[:space:]')
-    groups=$(echo "$groups" | tr -d '[:space:]')
+  # Check if user already exists
+  if id "$user" &> /dev/null; then
+    echo "User $user already exists, skipping." | tee -a $LOG_FILE
+    continue
+  fi
 
-    # Check if user already exists
-    if id "$username" &>/dev/null; then
-        log_message "User $username already exists. Skipping."
-        continue
+  # Create the user's personal group, handle if it exists
+  if ! groupadd $user; then
+    echo "Group $user already exists or failed to create." | tee -a $LOG_FILE
+  fi
+
+  # Create the user and add them to their personal group
+  if ! useradd -m -g $user -s /bin/bash $user; then
+    echo "Failed to create user $user." | tee -a $LOG_FILE
+    continue
+  fi
+
+  # Add the user to the specified groups
+  IFS=',' read -r -a group_array <<< "$groups"
+  for group in "${group_array[@]}"; do
+    if ! grep -q "^$group:" /etc/group; then
+      if ! groupadd $group; then
+        echo "Failed to create group $group for user $user." | tee -a $LOG_FILE
+      fi
     fi
-
-    # Create user and their personal group
-    useradd -m -U "$username"
-    if [ $? -ne 0 ]; then
-        log_message "Failed to create user $username"
-        continue
+    if ! usermod -aG $group $user; then
+      echo "Failed to add user $user to group $group." | tee -a $LOG_FILE
     fi
+  done
 
-    # Add user to additional groups
-    IFS=',' read -ra group_array <<< "$groups"
-    for group in "${group_array[@]}"; do
-        groupadd -f "$group"
-        usermod -aG "$group" "$username"
-    done
+  # Generate a random password for the user
+  password=$(pwgen -s 12 1)
 
-    # Generate and set password
-    password=$(generate_password)
-    echo "$username:$password" | chpasswd
-    echo "$username:$password" >> "$PASSWORD_FILE"
+  # Set the user's password
+  echo "$user:$password" | chpasswd
 
-    # Set home directory permissions
-    chown -R "$username:$username" "/home/$username"
-    chmod 700 "/home/$username"
+  # Log the action
+  echo "Created user $user with password $password and added to groups ${group_array[*]}" >> $LOG_FILE
 
-    log_message "User $username created successfully with groups: $groups"
-done < "$INPUT_FILE"
+  # Store the password securely
+  echo "$user,$password" >> $PASSWORD_FILE
+
+done < $INPUT_FILE
 
 echo "User creation process completed. Check $LOG_FILE for details."
